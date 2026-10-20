@@ -22,6 +22,9 @@ nominal/Daten jeweils 80 % (Backend-Vorgabe); BOA kann Timing anpassen.
 ETAS liefert im verwendeten Backend keine ESI-/Error-Frame-/Queue-Events;
 CSV-Werte fuer ESI/Error sind dort keine verlaessliche Fehlerdiagnose.
 Controller-Fehlerstatus wird zusaetzlich regelmaessig abgefragt.
+Busstatus: Fehlerzaehler-Warnungen (PEAK BUSLIGHT/BUSHEAVY, Error-Passive)
+werden nur angezeigt. Pufferueberlaeufe (moeglicher Frameverlust) werden
+gezaehlt und beim Log-Ende gemeldet. Nur BUS-OFF trennt die Verbindung.
 PEAK: Listen-only ist voreingestellt: keine Sendeframes, keine ACKs. Auf einem Bus
 mit nur einem Sender wird daher ein weiterer aktiver Teilnehmer benoetigt.
 PEAK-CAN-FD-Timing: 80 MHz, Sample Point nominal 80 %, Datenphase 75 %.
@@ -31,7 +34,7 @@ Bedienung: "Verbinden" oeffnet das Interface (Live-Anzeige laeuft sofort),
 "Start Log"/"Stopp Log" schalten nur die CSV-Aufzeichnung, ohne den Bus
 neu zu initialisieren. Mehrere Logs pro Verbindung sind moeglich; nach jedem
 Log wird ein neuer Dateiname vorgeschlagen. "Trennen" beendet einen
-laufenden Log und gibt das Interface frei. Bus-/Treiberfehler trennen die
+laufenden Log und gibt das Interface frei. BUS-OFF und Treiberfehler trennen die
 Verbindung; CSV-Fehler stoppen nur den Log.
 
 CSV: Semikolon, UTF-8 mit BOM; jede waehrend des Logs empfangene Nachricht
@@ -45,6 +48,8 @@ Die Live-Anzeige ist begrenzt und darf Frames auslassen, nicht die CSV.
 Erkannte Fehler werden gemeldet; eine verlustfreie Aufnahme bei beliebiger Buslast wird nicht garantiert.
 CSV wird alle 0,5 Sekunden und bei Stopp/Trennen geleert/geschlossen.
 Bestehende Dateien werden niemals ueberschrieben.
+Standard-Logordner ist der Windows-Downloads-Ordner (auch wenn verschoben);
+Fallback: ~/Downloads, sonst das aktuelle Arbeitsverzeichnis.
 """
 
 from __future__ import annotations
@@ -74,6 +79,31 @@ CSV_COLUMNS = (
 )
 
 
+def downloads_dir() -> Path:
+    candidates: list[Path] = []
+    try:
+        import ctypes
+        import uuid
+
+        # FOLDERID_Downloads; honours a relocated Downloads folder.
+        folder_id = uuid.UUID("{374DE290-123F-4565-9164-39C4925E467B}")
+        guid = (ctypes.c_byte * 16).from_buffer_copy(folder_id.bytes_le)
+        raw_path = ctypes.c_wchar_p()
+        shell32 = ctypes.windll.shell32
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(raw_path)) == 0:
+            try:
+                candidates.append(Path(raw_path.value or ""))
+            finally:
+                ctypes.windll.ole32.CoTaskMemFree(raw_path)
+    except (AttributeError, OSError, ValueError):
+        pass
+    candidates.append(Path.home() / "Downloads")
+    for candidate in candidates:
+        if str(candidate) and candidate.is_dir():
+            return candidate
+    return Path.cwd()
+
+
 @dataclass(frozen=True)
 class Settings:
     channel: str
@@ -91,6 +121,8 @@ class Progress:
     connected_s: float
     logging: bool
     log: tuple[int, int, float] | None  # frames, payload bytes, seconds
+    bus_state: str = "OK"
+    overruns: int = 0
 
 
 @dataclass(frozen=True)
@@ -143,14 +175,44 @@ def open_bus(settings: Settings) -> can.BusABC:
     )
 
 
-def check_bus_status(bus: can.BusABC, interface: str) -> None:
+PCAN_BUSOFF = 0x10
+PCAN_DATA_LOSS = 0x02 | 0x40  # OVERRUN (controller), QOVERRUN (receive queue)
+PCAN_WARNINGS = {
+    0x04: "Fehlerzaehler-Warnung (BUSLIGHT)",
+    0x08: "Fehlerzaehler hoch (BUSHEAVY)",
+    0x40000: "Error-Passive",
+}
+# 0x01/0x80: TX queue full, 0x20: RX queue empty; irrelevant for receiving.
+PCAN_KNOWN = PCAN_DATA_LOSS | 0x04 | 0x08 | 0x40000 | 0x01 | 0x20 | 0x80
+
+
+@dataclass(frozen=True)
+class BusHealth:
+    text: str = "OK"
+    data_loss: bool = False
+
+
+def check_bus_status(bus: can.BusABC, interface: str) -> BusHealth:
+    """Raises only for bus-off; warnings and overruns are reported, not fatal."""
     if interface == "pcan":
         from can.interfaces.pcan import PcanBus
 
         if not isinstance(bus, PcanBus):
-            return
-        status = bus.status()
-    elif interface == "etas":
+            return BusHealth()
+        status = int(bus.status())
+        if status & PCAN_BUSOFF:
+            raise RuntimeError(
+                f"PCAN-Status 0x{status:05X}: BUS-OFF. Keine Kommunikation moeglich. "
+                "Verkabelung, Terminierung und Bitraten pruefen."
+            )
+        texts = [text for bit, text in PCAN_WARNINGS.items() if status & bit]
+        data_loss = bool(status & PCAN_DATA_LOSS)
+        if data_loss:
+            texts.append("Pufferueberlauf, Frames verloren")
+        if status & ~PCAN_KNOWN:
+            texts.append(f"Status 0x{status:05X}")
+        return BusHealth(", ".join(texts) or "OK", data_loss)
+    if interface == "etas":
         import ctypes
         from can.interfaces.etas import EtasBus
         from can.interfaces.etas.boa import (
@@ -159,20 +221,22 @@ def check_bus_status(bus: can.BusABC, interface: str) -> None:
         )
 
         if not isinstance(bus, EtasBus):
-            return
+            return BusHealth()
         controller_status = OCI_CANControllerStatus()
         OCI_GetCANControllerStatus(bus.ctrl, ctypes.byref(controller_status))
-        status = controller_status.stateCode & (
-            OCI_CAN_STATE_BUSOFF | OCI_CAN_STATE_ERRLIMIT | OCI_CAN_STATE_PASSIVE
-        )
-    else:
-        raise ValueError(f"Unbekannter Treiber: {interface}")
-    if status:
-        raise RuntimeError(
-            f"{interface.upper()}-Status 0x{status:05X}: Bus-/Pufferfehler. "
-            "Aufzeichnung eventuell unvollstaendig. "
-            "Verkabelung, Terminierung, Bitraten und Buslast pruefen."
-        )
+        state = controller_status.stateCode
+        if state & OCI_CAN_STATE_BUSOFF:
+            raise RuntimeError(
+                f"ETAS-Status 0x{state:05X}: BUS-OFF. Keine Kommunikation moeglich. "
+                "Verkabelung, Terminierung und Bitraten pruefen."
+            )
+        texts = []
+        if state & OCI_CAN_STATE_ERRLIMIT:
+            texts.append("Fehlerzaehler-Warnung")
+        if state & OCI_CAN_STATE_PASSIVE:
+            texts.append("Error-Passive")
+        return BusHealth(", ".join(texts) or "OK")
+    raise ValueError(f"Unbekannter Treiber: {interface}")
 
 
 def scan_etas(results: queue.Queue[ScanResult]) -> None:
@@ -259,6 +323,9 @@ class CanConnection(threading.Thread):
         self.display_dropped = 0
         self.log: CsvLog | None = None
         self.last_log: tuple[int, int, float] | None = None
+        self.health = BusHealth()
+        self.overruns = 0
+        self.log_overruns = 0
 
     def start_log(self, path: Path) -> None:
         self.commands.put(path)
@@ -277,8 +344,18 @@ class CanConnection(threading.Thread):
             logged = self.last_log
         return Progress(
             self.frames, self.display_dropped, now - self.started,
-            self.log is not None, logged,
+            self.log is not None, logged, self.health.text, self.overruns,
         )
+
+    def update_health(self, health: BusHealth) -> None:
+        # Overrun flags may stay set; count rising edges, not every poll.
+        if health.data_loss and not self.health.data_loss:
+            self.overruns += 1
+            if self.log is not None:
+                self.log_overruns += 1
+        if health.text != self.health.text:
+            self.notices.put(Notice(text=f"Busstatus: {health.text}"))
+        self.health = health
 
     def close_log(self, reason: str = "") -> tuple[str, bool]:
         """Closes the active log; returns (message, close_failed)."""
@@ -295,6 +372,11 @@ class CanConnection(threading.Thread):
             messages.append(f"CSV konnte nicht geschlossen werden: {exc}")
             failed = True
         messages.append(f"Log beendet: {log.frames:,} Frames in {log.path}")
+        if self.log_overruns:
+            messages.append(
+                f"ACHTUNG: {self.log_overruns}x Pufferueberlauf waehrend des Logs "
+                "gemeldet - Frames koennen fehlen."
+            )
         return "\n".join(messages), failed
 
     def handle_commands(self) -> None:
@@ -313,6 +395,7 @@ class CanConnection(threading.Thread):
             elif self.log is None:
                 try:
                     self.log = CsvLog(path, self.settings.channel)
+                    self.log_overruns = 0
                 except Exception as exc:
                     self.notices.put(Notice(
                         text=f"Log konnte nicht gestartet werden: "
@@ -370,7 +453,7 @@ class CanConnection(threading.Thread):
                     except OSError as exc:
                         self.fail_log(exc)
                 if now - last_status >= 0.25:
-                    check_bus_status(bus, self.settings.interface)
+                    self.update_health(check_bus_status(bus, self.settings.interface))
                     last_status = now
                 if now - last_report >= 0.25:
                     self.notices.put(Notice(progress=self.progress()))
@@ -440,7 +523,7 @@ class LoggerApp:
 
     @staticmethod
     def default_path() -> Path:
-        return Path.cwd() / f"canfd_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
+        return downloads_dir() / f"canfd_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
 
     def build_ui(self) -> None:
         panel = ttk.Frame(self.root, padding=10)
@@ -607,7 +690,7 @@ class LoggerApp:
         selected = filedialog.asksaveasfilename(
             parent=self.root, title="Neue CSV-Datei waehlen (kein Ueberschreiben)",
             defaultextension=".csv", filetypes=[("CSV-Dateien", "*.csv")],
-            initialfile=self.default_path().name,
+            initialdir=str(downloads_dir()), initialfile=self.default_path().name,
         )
         if selected:
             self.path.set(selected)
@@ -731,6 +814,9 @@ class LoggerApp:
         else:
             text += " | Log: aus"
         text += f" | Nur Live-Anzeige verworfen: {progress.display_dropped:,}"
+        text += f" | Bus: {progress.bus_state}"
+        if progress.overruns:
+            text += f" | Pufferueberlaeufe: {progress.overruns}"
         self.statistics.set(text)
 
     def handle_scan_result(self, scan_result: ScanResult) -> None:
