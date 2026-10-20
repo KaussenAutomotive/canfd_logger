@@ -27,15 +27,23 @@ mit nur einem Sender wird daher ein weiterer aktiver Teilnehmer benoetigt.
 PEAK-CAN-FD-Timing: 80 MHz, Sample Point nominal 80 %, Datenphase 75 %.
 Bei abweichendem Netzwerktiming muessen diese Werte angepasst werden.
 
-CSV: Semikolon, UTF-8 mit BOM; jede empfangene Nachricht wird gespeichert.
+Bedienung: "Verbinden" oeffnet das Interface (Live-Anzeige laeuft sofort),
+"Start Log"/"Stopp Log" schalten nur die CSV-Aufzeichnung, ohne den Bus
+neu zu initialisieren. Mehrere Logs pro Verbindung sind moeglich; nach jedem
+Log wird ein neuer Dateiname vorgeschlagen. "Trennen" beendet einen
+laufenden Log und gibt das Interface frei. Bus-/Treiberfehler trennen die
+Verbindung; CSV-Fehler stoppen nur den Log.
+
+CSV: Semikolon, UTF-8 mit BOM; jede waehrend des Logs empfangene Nachricht
+wird gespeichert.
 adapter_timestamp_s ist der unveraenderte python-can/Adapter-Zeitstempel,
 nicht zwingend Unix-Zeit (abhaengig vom Backend und optionalem uptime-Paket).
-relative_s bezieht sich auf die erste Nachricht. dlc_bytes bezeichnet die
+relative_s bezieht sich auf die erste Nachricht des Logs (Live-Anzeige: seit
+Verbinden). dlc_bytes bezeichnet die
 dekodierte Laenge, nicht den 4-Bit-DLC-Code; bei RTR die angeforderte Laenge.
 Die Live-Anzeige ist begrenzt und darf Frames auslassen, nicht die CSV.
-Bei erkannten Bus-/Treiber-/Schreibfehlern wird mit Fehlermeldung gestoppt;
-eine verlustfreie Aufnahme bei beliebiger Buslast wird nicht garantiert.
-CSV wird alle 0,5 Sekunden und beim Stoppen geleert/geschlossen.
+Erkannte Fehler werden gemeldet; eine verlustfreie Aufnahme bei beliebiger Buslast wird nicht garantiert.
+CSV wird alle 0,5 Sekunden und bei Stopp/Trennen geleert/geschlossen.
 Bestehende Dateien werden niemals ueberschrieben.
 """
 
@@ -73,23 +81,23 @@ class Settings:
     nominal_bitrate: int
     data_bitrate: int
     listen_only: bool
-    path: Path
     interface: str = "pcan"
 
 
 @dataclass(frozen=True)
 class Progress:
     frames: int
-    payload_bytes: int
     display_dropped: int
-    elapsed: float
+    connected_s: float
+    logging: bool
+    log: tuple[int, int, float] | None  # frames, payload bytes, seconds
 
 
 @dataclass(frozen=True)
 class Notice:
     text: str = ""
     progress: Progress | None = None
-    finished: bool = False
+    event: str = ""  # connected, log_started, log_stopped, disconnected
     error: bool = False
 
 
@@ -198,80 +206,196 @@ def csv_row(message: can.Message, first_timestamp: float, channel: str) -> tuple
     )
 
 
-class Recorder(threading.Thread):
+class CsvLog:
+    def __init__(self, path: Path, channel: str) -> None:
+        self.path = path
+        self.channel = channel
+        self.file = path.open("x", newline="", encoding="utf-8-sig")
+        try:
+            self.writer = csv.writer(self.file, delimiter=";")
+            self.writer.writerow(CSV_COLUMNS)
+            self.file.flush()
+        except Exception:
+            self.file.close()
+            raise
+        self.frames = 0
+        self.payload_bytes = 0
+        self.first_timestamp: float | None = None
+        self.started = time.monotonic()
+        self.last_flush = self.started
+
+    def write(self, message: can.Message) -> None:
+        if self.first_timestamp is None:
+            self.first_timestamp = message.timestamp
+        self.writer.writerow(csv_row(message, self.first_timestamp, self.channel))
+        self.frames += 1
+        self.payload_bytes += len(message.data)
+
+    def flush(self) -> None:
+        self.file.flush()
+        self.last_flush = time.monotonic()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+class CanConnection(threading.Thread):
+    """Owns the bus; CSV logging is switched on/off via commands."""
+
     def __init__(
         self,
         settings: Settings,
         rows: queue.Queue[tuple[str, ...]],
         notices: queue.Queue[Notice],
     ) -> None:
-        super().__init__(name="CAN-Recorder", daemon=False)
+        super().__init__(name="CAN-Connection", daemon=False)
         self.settings = settings
         self.rows = rows
         self.notices = notices
-        self.stop_event = threading.Event()
+        self.commands: queue.Queue[Path | None] = queue.Queue()
+        self.disconnect_event = threading.Event()
+        self.started = time.monotonic()
+        self.frames = 0
+        self.display_dropped = 0
+        self.log: CsvLog | None = None
+        self.last_log: tuple[int, int, float] | None = None
+
+    def start_log(self, path: Path) -> None:
+        self.commands.put(path)
+
+    def stop_log(self) -> None:
+        self.commands.put(None)
+
+    def disconnect(self) -> None:
+        self.disconnect_event.set()
+
+    def progress(self) -> Progress:
+        now = time.monotonic()
+        if self.log is not None:
+            logged = (self.log.frames, self.log.payload_bytes, now - self.log.started)
+        else:
+            logged = self.last_log
+        return Progress(
+            self.frames, self.display_dropped, now - self.started,
+            self.log is not None, logged,
+        )
+
+    def close_log(self, reason: str = "") -> tuple[str, bool]:
+        """Closes the active log; returns (message, close_failed)."""
+        log = self.log
+        if log is None:
+            return "", False
+        self.log = None
+        self.last_log = (log.frames, log.payload_bytes, time.monotonic() - log.started)
+        messages = [reason] if reason else []
+        failed = False
+        try:
+            log.close()
+        except OSError as exc:
+            messages.append(f"CSV konnte nicht geschlossen werden: {exc}")
+            failed = True
+        messages.append(f"Log beendet: {log.frames:,} Frames in {log.path}")
+        return "\n".join(messages), failed
+
+    def handle_commands(self) -> None:
+        while True:
+            try:
+                path = self.commands.get_nowait()
+            except queue.Empty:
+                return
+            if path is None:
+                if self.log is not None:
+                    text, failed = self.close_log()
+                    self.notices.put(Notice(
+                        text=text, event="log_stopped", error=failed,
+                        progress=self.progress(),
+                    ))
+            elif self.log is None:
+                try:
+                    self.log = CsvLog(path, self.settings.channel)
+                except Exception as exc:
+                    self.notices.put(Notice(
+                        text=f"Log konnte nicht gestartet werden: "
+                        f"{type(exc).__name__}: {exc}",
+                        event="log_stopped", error=True,
+                    ))
+                else:
+                    self.notices.put(Notice(text=f"Log laeuft: {path}", event="log_started"))
+
+    def fail_log(self, exc: Exception) -> None:
+        text, _ = self.close_log(
+            f"CSV-Schreibfehler, Log gestoppt (Verbindung bleibt bestehen): "
+            f"{type(exc).__name__}: {exc}"
+        )
+        self.notices.put(Notice(
+            text=text, event="log_stopped", error=True, progress=self.progress(),
+        ))
 
     def run(self) -> None:
-        started = time.monotonic()
-        frames = payload_bytes = display_dropped = 0
         first_timestamp: float | None = None
         errors: list[str] = []
+        final_text = ""
         bus = None
-        output = None
         try:
             bus = open_bus(self.settings)
-            output = self.settings.path.open("x", newline="", encoding="utf-8-sig")
-            writer = csv.writer(output, delimiter=";")
-            writer.writerow(CSV_COLUMNS)
-            output.flush()
-            self.notices.put(Notice(text=f"Aufzeichnung: {self.settings.path}"))
-            last_flush = last_report = last_status = time.monotonic()
-            while not self.stop_event.is_set():
+            self.started = time.monotonic()
+            self.notices.put(Notice(
+                text=f"Verbunden: {self.settings.interface.upper()} {self.settings.channel}",
+                event="connected",
+            ))
+            last_report = last_status = time.monotonic()
+            while not self.disconnect_event.is_set():
+                self.handle_commands()
                 message = bus.recv(timeout=0.05)
                 if message is not None:
+                    self.frames += 1
                     if first_timestamp is None:
                         first_timestamp = message.timestamp
-                    row = csv_row(message, first_timestamp, self.settings.channel)
-                    writer.writerow(row)
-                    frames += 1
-                    payload_bytes += len(message.data)
+                    if self.log is not None:
+                        try:
+                            self.log.write(message)
+                        except (OSError, csv.Error) as exc:
+                            self.fail_log(exc)
                     try:
-                        self.rows.put_nowait(row)
+                        self.rows.put_nowait(
+                            csv_row(message, first_timestamp, self.settings.channel)
+                        )
                     except queue.Full:
-                        # Only the live view is lossy; the CSV was already written.
-                        display_dropped += 1
+                        # Only the live view is lossy; CSV writes happen before this.
+                        self.display_dropped += 1
                 now = time.monotonic()
-                if now - last_flush >= 0.5:
-                    output.flush()
-                    last_flush = now
+                if self.log is not None and now - self.log.last_flush >= 0.5:
+                    try:
+                        self.log.flush()
+                    except OSError as exc:
+                        self.fail_log(exc)
                 if now - last_status >= 0.25:
                     check_bus_status(bus, self.settings.interface)
                     last_status = now
                 if now - last_report >= 0.25:
-                    self.notices.put(Notice(progress=Progress(
-                        frames, payload_bytes, display_dropped, now - started,
-                    )))
+                    self.notices.put(Notice(progress=self.progress()))
                     last_report = now
         except Exception as exc:
             # The worker boundary must report driver and filesystem failures to Tk.
             errors.append(f"{type(exc).__name__}: {exc}")
         finally:
-            if output is not None:
-                try:
-                    output.close()
-                except OSError as exc:
-                    errors.append(f"CSV konnte nicht geschlossen werden: {exc}")
+            if self.log is not None:
+                final_text, close_failed = self.close_log(
+                    "Log wegen Verbindungsfehler beendet." if errors else ""
+                )
+                if close_failed:
+                    errors.append(final_text)
+                    final_text = ""
             if bus is not None:
                 try:
                     bus.shutdown()
                 except Exception as exc:
                     errors.append(f"CAN-Treiber konnte nicht freigegeben werden: {exc}")
+            lines = [text for text in (*errors, final_text) if text]
             self.notices.put(Notice(
-                text="\n".join(errors) if errors else "Gestoppt. CSV geschlossen.",
-                progress=Progress(
-                    frames, payload_bytes, display_dropped, time.monotonic() - started,
-                ),
-                finished=True,
+                text="\n".join(dict.fromkeys(lines + ["Getrennt."])),
+                progress=self.progress(),
+                event="disconnected",
                 error=bool(errors),
             ))
 
@@ -279,9 +403,12 @@ class Recorder(threading.Thread):
 class LoggerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.worker: Recorder | None = None
+        self.connection: CanConnection | None = None
+        self.connected = False
+        self.logging = False
+        self.log_pending = False
+        self.disconnecting = False
         self.closing = False
-        self.finished_notice: Notice | None = None
         self.rows: queue.Queue[tuple[str, ...]] = queue.Queue(DISPLAY_QUEUE_SIZE)
         self.notices: queue.Queue[Notice] = queue.Queue()
         self.scan_results: queue.Queue[ScanResult] = queue.Queue()
@@ -292,6 +419,7 @@ class LoggerApp:
         self.previous_backend = "PEAK PCAN"
         self.peak_listen_only = True
         self.config_widgets: list[tuple[ttk.Widget, str]] = []
+        self.log_widgets: list[ttk.Widget] = []
         self.channel = tk.StringVar(value="PCAN_USBBUS1")
         self.mode = tk.StringVar(value="CAN FD")
         self.nominal = tk.StringVar(value="500000")
@@ -299,12 +427,12 @@ class LoggerApp:
         self.listen_only = tk.BooleanVar(value=True)
         self.show_live = tk.BooleanVar(value=True)
         self.path = tk.StringVar(value=str(self.default_path()))
-        self.status = tk.StringVar(value="Bereit. Treiber: PEAK PCAN oder ETAS BOA.")
+        self.status = tk.StringVar(value="Getrennt. Interface waehlen und verbinden.")
         self.driver_hint = tk.StringVar()
-        self.statistics = tk.StringVar(value="Frames: 0 | Daten: 0 Bytes | Laufzeit: 0.0 s")
+        self.statistics = tk.StringVar(value="Nicht verbunden")
         self.root.title("PEAK / ETAS BOA CAN FD Logger")
-        self.root.geometry("1180x690")
-        self.root.minsize(850, 480)
+        self.root.geometry("1180x720")
+        self.root.minsize(850, 500)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.build_ui()
         self.update_backend()
@@ -317,7 +445,7 @@ class LoggerApp:
     def build_ui(self) -> None:
         panel = ttk.Frame(self.root, padding=10)
         panel.pack(fill="both", expand=True)
-        config = ttk.LabelFrame(panel, text="Verbindung", padding=8)
+        config = ttk.LabelFrame(panel, text="Interface", padding=8)
         config.pack(fill="x")
         driver_panel = ttk.Frame(config)
         driver_panel.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 8))
@@ -332,6 +460,16 @@ class LoggerApp:
             driver_panel, text="ETAS-Kanaele suchen", command=self.start_scan,
         )
         self.scan_button.pack(side="left")
+        self.disconnect_button = ttk.Button(
+            driver_panel, text="Trennen", command=self.disconnect,
+        )
+        self.disconnect_button.pack(side="right")
+        self.connect_button = ttk.Button(
+            driver_panel, text="Verbinden", command=self.connect,
+        )
+        self.connect_button.pack(side="right", padx=6)
+        self.connection_label = ttk.Label(driver_panel, text="Getrennt")
+        self.connection_label.pack(side="right", padx=12)
         self.config_widgets.append((backend_box, "readonly"))
         fields = (
             ("Kanal / BOA-URI", self.channel,
@@ -360,22 +498,20 @@ class LoggerApp:
         ttk.Label(
             config, textvariable=self.driver_hint, wraplength=650,
         ).grid(row=3, column=2, columnspan=2, sticky="w", padx=4)
-        file_panel = ttk.Frame(panel)
-        file_panel.pack(fill="x", pady=10)
-        ttk.Label(file_panel, text="CSV-Datei:").pack(side="left")
-        path_entry = ttk.Entry(file_panel, textvariable=self.path)
+        log_frame = ttk.LabelFrame(panel, text="CSV-Log", padding=8)
+        log_frame.pack(fill="x", pady=10)
+        ttk.Label(log_frame, text="Datei:").pack(side="left")
+        path_entry = ttk.Entry(log_frame, textvariable=self.path)
         path_entry.pack(side="left", fill="x", expand=True, padx=8)
-        browse = ttk.Button(file_panel, text="Auswaehlen ...", command=self.browse)
+        browse = ttk.Button(log_frame, text="Auswaehlen ...", command=self.browse)
         browse.pack(side="left")
-        self.config_widgets.extend(((path_entry, "normal"), (browse, "normal")))
+        self.log_widgets.extend((path_entry, browse))
+        self.start_button = ttk.Button(log_frame, text="Start Log", command=self.start)
+        self.start_button.pack(side="left", padx=(12, 0))
+        self.stop_button = ttk.Button(log_frame, text="Stopp Log", command=self.stop)
+        self.stop_button.pack(side="left", padx=6)
         controls = ttk.Frame(panel)
         controls.pack(fill="x", pady=(0, 8))
-        self.start_button = ttk.Button(controls, text="Start", command=self.start)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(
-            controls, text="Stopp", command=self.stop, state="disabled",
-        )
-        self.stop_button.pack(side="left", padx=6)
         ttk.Button(controls, text="Anzeige leeren", command=self.clear_view).pack(side="left")
         ttk.Checkbutton(
             controls, text="Live-Anzeige (letzte 1500 Frames)", variable=self.show_live,
@@ -386,7 +522,7 @@ class LoggerApp:
         columns = ("time", "channel", "id", "format", "flags", "length", "data")
         self.tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="browse")
         for column, label, width in (
-            ("time", "Relativ [s]", 110), ("channel", "Kanal", 130),
+            ("time", "Seit Verbinden [s]", 120), ("channel", "Kanal", 130),
             ("id", "ID (hex)", 90), ("format", "Format", 75),
             ("flags", "Flags", 150), ("length", "Bytes / RTR-Laenge", 120),
             ("data", "Daten (hex)", 600),
@@ -418,27 +554,53 @@ class LoggerApp:
         self.channel_box.configure(values=(
             self.etas_channels if etas else tuple(f"PCAN_USBBUS{i}" for i in range(1, 17))
         ))
-        idle = self.worker is None and self.scan_worker is None
-        self.passive.configure(state="normal" if idle and not etas else "disabled")
-        self.scan_button.configure(state="normal" if idle and etas else "disabled")
         self.driver_hint.set(
             "ETAS BOA: aktive Teilnahme mit ACKs, kein Listen-only. "
             "Sample Points: 80 % / 80 %. ESI-/Error-/Queue-Events nicht verfuegbar."
             if etas else "PEAK CAN FD: 80 MHz | Sample Points: nominal 80 %, Daten 75 %"
         )
+        self.update_controls()
+
+    def update_controls(self) -> None:
+        idle = self.connection is None and self.scan_worker is None
+        etas = self.backend.get() == "ETAS BOA"
+        busy = self.log_pending or self.disconnecting
+        for widget, state in self.config_widgets:
+            widget.configure(state=state if idle else "disabled")
+        self.passive.configure(state="normal" if idle and not etas else "disabled")
+        self.scan_button.configure(state="normal" if idle and etas else "disabled")
+        self.connect_button.configure(state="normal" if idle else "disabled")
+        self.disconnect_button.configure(
+            state="normal" if self.connection is not None and not self.disconnecting
+            else "disabled"
+        )
+        for widget in self.log_widgets:
+            widget.configure(state="disabled" if self.logging or busy else "normal")
+        self.start_button.configure(
+            state="normal" if self.connected and not self.logging and not busy
+            else "disabled"
+        )
+        self.stop_button.configure(
+            state="normal" if self.logging and not busy else "disabled"
+        )
+        if self.disconnecting:
+            text = "Trenne ..."
+        elif self.connected:
+            text = "Verbunden, Log laeuft" if self.logging else "Verbunden"
+        elif self.connection is not None:
+            text = "Verbinde ..."
+        else:
+            text = "Getrennt"
+        self.connection_label.configure(text=text)
 
     def start_scan(self) -> None:
-        if self.worker is not None or self.scan_worker is not None:
+        if self.connection is not None or self.scan_worker is not None:
             return
         self.status.set("Suche ETAS-BOA-Kanaele ...")
         self.scan_worker = threading.Thread(
             target=scan_etas, args=(self.scan_results,), name="ETAS-Discovery", daemon=True,
         )
-        for widget, _ in self.config_widgets:
-            widget.configure(state="disabled")
-        self.start_button.configure(state="disabled")
-        self.scan_button.configure(state="disabled")
-        self.passive.configure(state="disabled")
+        self.update_controls()
         self.scan_worker.start()
 
     def browse(self) -> None:
@@ -469,6 +631,9 @@ class LoggerApp:
             raise ValueError("Nominal-Bitrate muss zwischen 1 und 1000000 bit/s liegen.")
         if fd and not nominal <= data_rate <= 8_000_000:
             raise ValueError("Datenbitrate muss >= nominal und <= 8000000 bit/s sein.")
+        return Settings(channel, fd, nominal, data_rate, self.listen_only.get(), interface)
+
+    def get_log_path(self) -> Path:
         if not self.path.get().strip():
             raise ValueError("Bitte eine CSV-Datei angeben.")
         path = Path(self.path.get().strip()).expanduser().resolve()
@@ -476,12 +641,10 @@ class LoggerApp:
             raise ValueError("Datei existiert bereits. Bitte eine neue CSV-Datei waehlen.")
         if not path.parent.is_dir():
             raise ValueError("Der Zielordner existiert nicht.")
-        return Settings(
-            channel, fd, nominal, data_rate, self.listen_only.get(), path, interface,
-        )
+        return path
 
-    def start(self) -> None:
-        if self.worker is not None or self.scan_worker is not None:
+    def connect(self) -> None:
+        if self.connection is not None or self.scan_worker is not None:
             return
         try:
             import can
@@ -493,28 +656,43 @@ class LoggerApp:
                 parent=self.root,
             )
             return
-        except (ValueError, OSError) as exc:
+        except ValueError as exc:
             messagebox.showerror("Ungueltige Einstellungen", str(exc), parent=self.root)
             return
         self.clear_view()
         self.discard_pending_rows()
-        self.finished_notice = None
-        self.statistics.set("Frames: 0 | Daten: 0 Bytes | Laufzeit: 0.0 s")
+        self.statistics.set("Verbinde ...")
         self.status.set(f"Verbinde mit {self.backend.get()} ...")
-        for widget, _ in self.config_widgets:
-            widget.configure(state="disabled")
-        self.start_button.configure(state="disabled")
-        self.scan_button.configure(state="disabled")
-        self.passive.configure(state="disabled")
-        self.stop_button.configure(state="normal")
-        self.worker = Recorder(settings, self.rows, self.notices)
-        self.worker.start()
+        self.connection = CanConnection(settings, self.rows, self.notices)
+        self.update_controls()
+        self.connection.start()
+
+    def disconnect(self) -> None:
+        if self.connection is not None and not self.disconnecting:
+            self.disconnecting = True
+            self.status.set("Trenne Interface und schliesse ggf. CSV ...")
+            self.connection.disconnect()
+            self.update_controls()
+
+    def start(self) -> None:
+        if self.connection is None or not self.connected or self.logging or self.log_pending:
+            return
+        try:
+            path = self.get_log_path()
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Ungueltige CSV-Datei", str(exc), parent=self.root)
+            return
+        self.log_pending = True
+        self.status.set(f"Starte Log: {path}")
+        self.connection.start_log(path)
+        self.update_controls()
 
     def stop(self) -> None:
-        if self.worker is not None:
-            self.worker.stop_event.set()
-            self.stop_button.configure(state="disabled")
-            self.status.set("Stoppe und schliesse CSV ...")
+        if self.connection is not None and self.logging and not self.log_pending:
+            self.log_pending = True
+            self.status.set("Stoppe Log und schliesse CSV ...")
+            self.connection.stop_log()
+            self.update_controls()
 
     def clear_view(self) -> None:
         children = self.tree.get_children()
@@ -540,49 +718,99 @@ class LoggerApp:
             " ".join(flags), row[11], row[12],
         ))
 
+    def show_progress(self, progress: Progress) -> None:
+        text = (
+            f"Empfangen: {progress.frames:,} Frames | Verbunden: {progress.connected_s:.1f} s"
+        )
+        if progress.log is not None:
+            frames, payload_bytes, seconds = progress.log
+            state = "aktiv" if progress.logging else "zuletzt"
+            text += (
+                f" | Log {state}: {frames:,} Frames, {payload_bytes:,} Bytes, {seconds:.1f} s"
+            )
+        else:
+            text += " | Log: aus"
+        text += f" | Nur Live-Anzeige verworfen: {progress.display_dropped:,}"
+        self.statistics.set(text)
+
+    def handle_scan_result(self, scan_result: ScanResult) -> None:
+        self.scan_worker = None
+        if scan_result.error:
+            self.status.set("ETAS-Kanalsuche fehlgeschlagen.")
+            self.update_backend()
+            messagebox.showerror(
+                "ETAS BOA", scan_result.error
+                + "\n\nETAS BOA V2, Geraetetreiber und DLL-Architektur pruefen.",
+                parent=self.root,
+            )
+            return
+        self.etas_channels = scan_result.channels
+        if self.channel.get() not in self.etas_channels:
+            self.channel.set(self.etas_channels[0] if self.etas_channels else "")
+        self.status.set(
+            f"{len(self.etas_channels)} ETAS-Kanal/Kanaele gefunden."
+            if self.etas_channels else
+            "Keine ETAS-Kanaele gefunden. Geraet, Verbindung und BOA pruefen."
+        )
+        self.update_backend()
+
+    def handle_notice(self, notice: Notice) -> bool:
+        """Returns False when the window was destroyed."""
+        if notice.text:
+            self.status.set(notice.text)
+        if notice.progress is not None:
+            self.show_progress(notice.progress)
+        if notice.event == "connected":
+            self.connected = True
+        elif notice.event == "log_started":
+            self.logging = True
+            self.log_pending = False
+        elif notice.event == "log_stopped":
+            self.logging = False
+            self.log_pending = False
+            self.path.set(str(self.default_path()))
+        elif notice.event == "disconnected":
+            if self.connection is not None:
+                self.connection.join()
+            was_logging = self.logging
+            self.connection = None
+            self.connected = self.logging = self.log_pending = self.disconnecting = False
+            if was_logging:
+                self.path.set(str(self.default_path()))
+            self.update_controls()
+            if notice.error:
+                self.closing = False
+                messagebox.showerror(
+                    "Verbindung getrennt / Log unvollstaendig",
+                    notice.text
+                    + "\n\nBei Verbindungsproblemen: passenden PEAK-/ETAS-Treiber, "
+                    "PCAN-Basic bzw. ETAS BOA V2, "
+                    "DLL-Architektur, FD-Hardware und Bit-Timing pruefen.",
+                    parent=self.root,
+                )
+            if self.closing:
+                self.root.destroy()
+                return False
+            return True
+        self.update_controls()
+        if notice.error and notice.event == "log_stopped":
+            messagebox.showerror("CSV-Log", notice.text, parent=self.root)
+        return True
+
     def poll(self) -> None:
         try:
             scan_result = self.scan_results.get_nowait()
         except queue.Empty:
             scan_result = None
         if scan_result is not None:
-            self.scan_worker = None
-            for widget, state in self.config_widgets:
-                widget.configure(state=state)
-            self.start_button.configure(state="normal")
-            if scan_result.error:
-                self.status.set("ETAS-Kanalsuche fehlgeschlagen.")
-                messagebox.showerror(
-                    "ETAS BOA", scan_result.error
-                    + "\n\nETAS BOA V2, Geraetetreiber und DLL-Architektur pruefen.",
-                    parent=self.root,
-                )
-            else:
-                self.etas_channels = scan_result.channels
-                if self.channel.get() not in self.etas_channels:
-                    self.channel.set(self.etas_channels[0] if self.etas_channels else "")
-                self.status.set(
-                    f"{len(self.etas_channels)} ETAS-Kanal/Kanaele gefunden."
-                    if self.etas_channels else
-                    "Keine ETAS-Kanaele gefunden. Geraet, Verbindung und BOA pruefen."
-                )
-            self.update_backend()
+            self.handle_scan_result(scan_result)
         while True:
             try:
                 notice = self.notices.get_nowait()
             except queue.Empty:
                 break
-            if notice.text:
-                self.status.set(notice.text)
-            if notice.progress is not None:
-                progress = notice.progress
-                self.statistics.set(
-                    f"Frames: {progress.frames:,} | Daten: {progress.payload_bytes:,} Bytes"
-                    f" | Laufzeit: {progress.elapsed:.1f} s"
-                    f" | Nur Live-Anzeige verworfen: {progress.display_dropped:,}"
-                )
-            if notice.finished:
-                self.finished_notice = notice
+            if not self.handle_notice(notice):
+                return
 
         auto_scroll = self.tree.yview()[1] >= 0.99
         for _ in range(250):
@@ -597,44 +825,19 @@ class LoggerApp:
             self.tree.delete(*children[:-DISPLAY_ROWS])
         if auto_scroll and children:
             self.tree.see(children[-1])
-
-        if (
-            self.worker is not None
-            and self.finished_notice is not None
-            and not self.worker.is_alive()
-        ):
-            self.worker.join()
-            self.worker = None
-            for widget, state in self.config_widgets:
-                widget.configure(state=state)
-            self.start_button.configure(state="normal")
-            self.stop_button.configure(state="disabled")
-            self.update_backend()
-            if self.finished_notice is not None and self.finished_notice.error:
-                self.closing = False
-                messagebox.showerror(
-                    "Aufzeichnung fehlgeschlagen / unvollstaendig",
-                    self.finished_notice.text
-                    + "\n\nBei Verbindungsproblemen: passenden PEAK-/ETAS-Treiber, "
-                    "PCAN-Basic bzw. ETAS BOA V2, "
-                    "DLL-Architektur, FD-Hardware und Bit-Timing pruefen.",
-                    parent=self.root,
-                )
-            if self.closing:
-                self.root.destroy()
-                return
         self.root.after(100, self.poll)
 
     def close(self) -> None:
-        if self.worker is not None:
-            if messagebox.askyesno(
-                "Logger beenden", "Aufzeichnung stoppen und CSV schliessen?",
-                parent=self.root,
-            ):
-                self.closing = True
-                self.stop()
-        else:
+        if self.connection is None:
             self.root.destroy()
+            return
+        question = (
+            "Log laeuft. Log stoppen, Interface trennen und beenden?"
+            if self.logging else "Interface trennen und beenden?"
+        )
+        if messagebox.askyesno("Logger beenden", question, parent=self.root):
+            self.closing = True
+            self.disconnect()
 
 
 def main() -> None:
